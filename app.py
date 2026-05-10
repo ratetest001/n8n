@@ -4,17 +4,27 @@ import requests
 import os
 import json
 import tempfile
-import math
-import shutil
 
 app = Flask(__name__)
 
+
 def download_file(url, dest_path):
-    """Download any file from URL to local path"""
-    response = requests.get(url, stream=True)
+    """Download file following redirects"""
+    session = requests.Session()
+    response = session.get(url, stream=True, allow_redirects=True)
+    
+    # Handle Google Drive virus scan warning page
+    for key, value in response.cookies.items():
+        if key.startswith('download_warning'):
+            url = url + f"&confirm={value}"
+            response = session.get(url, stream=True, allow_redirects=True)
+            break
+    
     with open(dest_path, 'wb') as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            f.write(chunk)
+        for chunk in response.iter_content(chunk_size=32768):
+            if chunk:
+                f.write(chunk)
+    
     return dest_path
 
 
@@ -32,32 +42,10 @@ def get_audio_duration(audio_path):
     
     # Fallback if ffprobe still can't read it
     if not output or output == 'N/A':
-        # Estimate from file size: MP3 128kbps = 16000 bytes/sec
         file_size = os.path.getsize(audio_path)
         return max(5.0, file_size / 16000)
     
     return float(output)
-
-
-def download_file(url, dest_path):
-    """Download file following redirects"""
-    session = requests.Session()
-    response = session.get(url, stream=True, allow_redirects=True)
-    
-    # Handle Google Drive virus scan warning page
-    for key, value in response.cookies.items():
-        if key.startswith('download_warning'):
-            # Re-request with confirm parameter
-            url = url + f"&confirm={value}"
-            response = session.get(url, stream=True, allow_redirects=True)
-            break
-    
-    with open(dest_path, 'wb') as f:
-        for chunk in response.iter_content(chunk_size=32768):
-            if chunk:
-                f.write(chunk)
-    
-    return dest_path
 
 
 def create_scene_video(scene, temp_dir, scene_index):
@@ -131,6 +119,7 @@ def create_scene_video(scene, temp_dir, scene_index):
     filter_complex = ';'.join(filter_parts)
     scene_output = os.path.join(temp_dir, f"scene_{scene_index}.mp4")
     
+    # --- Build FFmpeg command ---
     cmd = ['ffmpeg', '-y']
     cmd.extend(inputs)
     cmd.extend([
@@ -140,6 +129,7 @@ def create_scene_video(scene, temp_dir, scene_index):
         '-c:v', 'libx264',
         '-preset', 'fast',
         '-crf', '23',
+        '-pix_fmt', 'yuv420p',
         '-c:a', 'aac',
         '-shortest',
         '-r', '25',
@@ -149,15 +139,21 @@ def create_scene_video(scene, temp_dir, scene_index):
     print(f"Running FFmpeg for scene {scene_index}...")
     result = subprocess.run(cmd, capture_output=True, text=True)
     
+    # Only fail on actual errors, ignore warnings
     if result.returncode != 0:
-        raise Exception(f"FFmpeg error: {result.stderr[-500:]}")
+        raise Exception(f"FFmpeg failed (code {result.returncode}): {result.stderr[-800:]}")
     
+    # Verify output file exists and has size
+    if not os.path.exists(scene_output) or os.path.getsize(scene_output) < 1000:
+        raise Exception(f"FFmpeg produced no output. Stderr: {result.stderr[-500:]}")
+    
+    print(f"Scene {scene_index} done: {os.path.getsize(scene_output)} bytes")
     return scene_output
+
 
 def concatenate_scenes(scene_videos, output_path, temp_dir):
     """Concatenate all scene MP4s into final video"""
     
-    # Create concat file
     concat_file = os.path.join(temp_dir, 'concat.txt')
     with open(concat_file, 'w') as f:
         for video_path in scene_videos:
@@ -171,8 +167,15 @@ def concatenate_scenes(scene_videos, output_path, temp_dir):
         '-c', 'copy',
         output_path
     ]
-    subprocess.run(cmd, check=True)
+    
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        raise Exception(f"Concat failed: {result.stderr[-500:]}")
+    
+    print(f"Final video: {os.path.getsize(output_path)} bytes")
     return output_path
+
 
 @app.route('/generate-video', methods=['POST'])
 def generate_video():
@@ -181,12 +184,15 @@ def generate_video():
         scenes = data
 
         with tempfile.TemporaryDirectory() as temp_dir:
+            
+            # Step 1: Generate each scene video
             scene_videos = []
             for i, scene in enumerate(scenes):
                 print(f"Processing scene {i+1}/{len(scenes)}...")
                 scene_path = create_scene_video(scene, temp_dir, i)
                 scene_videos.append(scene_path)
 
+            # Step 2: Concatenate all scenes
             final_output = os.path.join(temp_dir, 'final_video.mp4')
             concatenate_scenes(scene_videos, final_output, temp_dir)
 
@@ -201,14 +207,16 @@ def generate_video():
 
     except Exception as e:
         import traceback
-        print(traceback.format_exc())  # Full error in Railway logs
+        print(traceback.format_exc())
         return jsonify({
             "success": False,
             "error": str(e)
         }), 500
 
+
 @app.route('/health', methods=['GET'])
 def health():
+    import shutil
     ffmpeg_path = shutil.which('ffmpeg')
     ffprobe_path = shutil.which('ffprobe')
     return jsonify({
@@ -217,5 +225,7 @@ def health():
         "ffprobe": ffprobe_path or "NOT FOUND"
     })
 
+
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)

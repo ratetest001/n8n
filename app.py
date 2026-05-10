@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 import subprocess
 import requests
 import os
@@ -51,7 +51,7 @@ def get_audio_duration(audio_path):
 
 
 def create_scene_video(scene, temp_dir, scene_index):
-    """Create MP4 for one scene"""
+    """Create MP4 for one scene - memory optimized"""
     
     # Download audio first
     audio_id = scene['audioFileId']
@@ -63,9 +63,9 @@ def create_scene_video(scene, temp_dir, scene_index):
     audio_size = os.path.getsize(audio_path)
     print(f"Audio size: {audio_size} bytes")
     if audio_size < 1000:
-        raise Exception(f"Audio download failed or too small: {audio_size} bytes")
+        raise Exception(f"Audio download failed: {audio_size} bytes")
     
-    # Get exact duration from local file
+    # Get duration from local file
     duration = get_audio_duration(audio_path)
     print(f"Scene {scene_index} duration: {duration}s")
     
@@ -79,69 +79,94 @@ def create_scene_video(scene, temp_dir, scene_index):
         download_file(img_url, img_path)
         image_paths.append(img_path)
     
-    # Build FFmpeg filter
-    filter_parts = []
-    inputs = []
-    
+    # Process each image into a short clip separately (memory efficient)
+    scene_clips = []
     for i, img_path in enumerate(image_paths):
-        inputs.extend(['-loop', '1', '-t', str(time_per_image), '-i', img_path])
-        zoom = "zoom+0.001" if i % 2 == 0 else "if(lte(zoom,1.0),1.5,max(1.001,zoom-0.001))"
-        filter_parts.append(
-            f"[{i}]scale=1920:1080,setsar=1,"
-            f"zoompan=z='{zoom}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
-            f"d={int(time_per_image*25)}:s=1920x1080:fps=25[v{i}]"
-        )
+        clip_path = os.path.join(temp_dir, f"clip_{scene_index}_{i}.mp4")
+        
+        cmd = [
+            'ffmpeg', '-y',
+            '-loop', '1',
+            '-i', img_path,
+            '-t', str(time_per_image),
+            '-vf', 'scale=1280:720,setsar=1',
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-crf', '28',
+            '-pix_fmt', 'yuv420p',
+            '-r', '24',
+            clip_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise Exception(f"Clip {i} failed: {result.stderr[-300:]}")
+        
+        scene_clips.append(clip_path)
+        print(f"Clip {i} done")
     
-    concat_inputs = ''.join([f'[v{i}]' for i in range(num_images)])
-    filter_parts.append(f"{concat_inputs}concat=n={num_images}:v=1:a=0[base]")
+    # Concatenate all image clips into one video
+    clips_concat_file = os.path.join(temp_dir, f"clips_{scene_index}.txt")
+    with open(clips_concat_file, 'w') as f:
+        for clip_path in scene_clips:
+            f.write(f"file '{clip_path}'\n")
     
-    audio_input_idx = num_images
-    inputs.extend(['-i', audio_path])
+    video_only = os.path.join(temp_dir, f"video_only_{scene_index}.mp4")
+    cmd = [
+        'ffmpeg', '-y',
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', clips_concat_file,
+        '-c', 'copy',
+        video_only
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Exception(f"Clip concat failed: {result.stderr[-300:]}")
     
-    # Escape text for FFmpeg
+    # Add audio + text overlay
     text = scene.get('text', '')
     text = text.replace('\\', '\\\\')
     text = text.replace("'", "\u2019")
     text = text.replace(':', '\\:')
     text = text.replace(',', '\\,')
     
-    filter_parts.append(
-        f"[base]drawtext="
-        f"text='{text}':"
-        f"fontsize=38:"
-        f"fontcolor=white:"
-        f"box=1:boxcolor=black@0.6:boxborderw=12:"
-        f"x=(w-text_w)/2:"
-        f"y=h-120[outv]"
-    )
-    
-    filter_complex = ';'.join(filter_parts)
     scene_output = os.path.join(temp_dir, f"scene_{scene_index}.mp4")
     
-    cmd = ['ffmpeg', '-y']
-    cmd.extend(inputs)
-    cmd.extend([
-        '-filter_complex', filter_complex,
-        '-map', '[outv]',
-        '-map', f'{audio_input_idx}:a',
+    cmd = [
+        'ffmpeg', '-y',
+        '-i', video_only,
+        '-i', audio_path,
+        '-vf', (
+            f"drawtext=text='{text}':"
+            f"fontsize=28:"
+            f"fontcolor=white:"
+            f"box=1:boxcolor=black@0.6:boxborderw=10:"
+            f"x=(w-text_w)/2:"
+            f"y=h-80"
+        ),
         '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '23',
+        '-preset', 'ultrafast',
+        '-crf', '28',
         '-pix_fmt', 'yuv420p',
         '-c:a', 'aac',
         '-shortest',
-        '-r', '25',
+        '-r', '24',
         scene_output
-    ])
+    ]
     
-    print(f"Running FFmpeg for scene {scene_index}...")
     result = subprocess.run(cmd, capture_output=True, text=True)
-    
     if result.returncode != 0:
         raise Exception(f"FFmpeg failed (code {result.returncode}): {result.stderr[-800:]}")
     
     if not os.path.exists(scene_output) or os.path.getsize(scene_output) < 1000:
-        raise Exception(f"FFmpeg produced no output. Stderr: {result.stderr[-500:]}")
+        raise Exception(f"FFmpeg produced no output")
+    
+    # Cleanup intermediate files to free disk space
+    for clip_path in scene_clips:
+        os.remove(clip_path)
+    os.remove(video_only)
+    os.remove(clips_concat_file)
     
     print(f"Scene {scene_index} done: {os.path.getsize(scene_output)} bytes")
     return scene_output
@@ -165,7 +190,6 @@ def concatenate_scenes(scene_videos, output_path, temp_dir):
     ]
     
     result = subprocess.run(cmd, capture_output=True, text=True)
-    
     if result.returncode != 0:
         raise Exception(f"Concat failed: {result.stderr[-500:]}")
     
@@ -176,7 +200,6 @@ def concatenate_scenes(scene_videos, output_path, temp_dir):
 def process_video_job(job_id, scenes):
     """Background thread: generate video and store result"""
     
-    # Create a persistent temp dir (not auto-deleted)
     temp_dir = tempfile.mkdtemp(prefix=f"job_{job_id}_")
     
     try:
@@ -195,7 +218,6 @@ def process_video_job(job_id, scenes):
         
         file_size = os.path.getsize(final_output)
         
-        # Store final video path for download
         jobs[job_id]['status'] = 'done'
         jobs[job_id]['file_path'] = final_output
         jobs[job_id]['temp_dir'] = temp_dir
@@ -208,7 +230,6 @@ def process_video_job(job_id, scenes):
         print(traceback.format_exc())
         jobs[job_id]['status'] = 'error'
         jobs[job_id]['error'] = str(e)
-        # Cleanup on error
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -221,16 +242,16 @@ def generate_video():
         if not scenes or not isinstance(scenes, list):
             return jsonify({"success": False, "error": "Invalid input"}), 400
         
-        # Create job
         job_id = str(uuid.uuid4())
         jobs[job_id] = {
             "status": "queued",
             "progress": "Starting...",
             "file_size_mb": None,
+            "file_path": None,
+            "temp_dir": None,
             "error": None
         }
         
-        # Start background thread
         thread = threading.Thread(
             target=process_video_job,
             args=(job_id, scenes),
@@ -238,7 +259,6 @@ def generate_video():
         )
         thread.start()
         
-        # Return immediately with job ID
         return jsonify({
             "success": True,
             "job_id": job_id,
@@ -262,7 +282,7 @@ def get_status(job_id):
     return jsonify({
         "success": True,
         "job_id": job_id,
-        "status": job['status'],        # queued / processing / done / error
+        "status": job['status'],
         "progress": job.get('progress'),
         "file_size_mb": job.get('file_size_mb'),
         "error": job.get('error'),
@@ -273,7 +293,6 @@ def get_status(job_id):
 @app.route('/download/<job_id>', methods=['GET'])
 def download_video(job_id):
     """Download the final video file"""
-    from flask import send_file
     
     if job_id not in jobs:
         return jsonify({"error": "Job not found"}), 404
@@ -306,5 +325,5 @@ def health():
 
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)

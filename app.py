@@ -55,7 +55,7 @@ def create_scene_video(scene, temp_dir, scene_index):
     
     # Download audio first
     audio_id = scene['audioFileId']
-    audio_url = f"https://drive.google.com/uc?export=download&id={audio_id}"
+    audio_url = f"https://drive.usercontent.google.com/download?id={audio_id}&export=download&authuser=0&confirm=t"
     audio_path = os.path.join(temp_dir, f"audio_{scene_index}.mp3")
     print(f"Downloading audio for scene {scene_index}...")
     download_file(audio_url, audio_path)

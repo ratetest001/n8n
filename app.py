@@ -5,6 +5,7 @@ import os
 import json
 import tempfile
 import math
+import shutil
 
 app = Flask(__name__)
 
@@ -166,7 +167,13 @@ def generate_video():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok"})
+    ffmpeg_path = shutil.which('ffmpeg')
+    ffprobe_path = shutil.which('ffprobe')
+    return jsonify({
+        "status": "ok",
+        "ffmpeg": ffmpeg_path or "NOT FOUND",
+        "ffprobe": ffprobe_path or "NOT FOUND"
+    })
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)

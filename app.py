@@ -232,6 +232,39 @@ def process_video_job(job_id, scenes):
         jobs[job_id]['error'] = str(e)
         shutil.rmtree(temp_dir, ignore_errors=True)
 
+@app.route('/test-audio/<file_id>', methods=['GET'])
+def test_audio(file_id):
+    import tempfile
+    
+    urls_to_try = [
+        f"https://drive.google.com/uc?export=download&id={file_id}",
+        f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t",
+    ]
+    
+    results = []
+    for url in urls_to_try:
+        try:
+            session = requests.Session()
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            response = session.get(url, headers=headers,
+                                  allow_redirects=True, timeout=30)
+            content_type = response.headers.get('Content-Type', 'unknown')
+            first_bytes = response.content[:20].hex()
+            first_text = response.content[:100].decode('utf-8', errors='ignore')
+            
+            results.append({
+                "url": url,
+                "status_code": response.status_code,
+                "content_type": content_type,
+                "content_length": len(response.content),
+                "first_bytes_hex": first_bytes,
+                "first_text": first_text,
+                "is_html": 'text/html' in content_type,
+            })
+        except Exception as e:
+            results.append({"url": url, "error": str(e)})
+    
+    return jsonify(results)
 
 @app.route('/generate-video', methods=['POST'])
 def generate_video():

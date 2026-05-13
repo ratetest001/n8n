@@ -50,173 +50,6 @@ def get_audio_duration(audio_path):
     return float(output)
 
 
-def create_scene_video(scene, temp_dir, scene_index):
-    """Create MP4 for one scene - memory optimized"""
-    
-    # Download audio first
-    audio_id = scene['audioFileId']
-    audio_url = f"https://drive.usercontent.google.com/download?id={audio_id}&export=download&authuser=0&confirm=t"
-    audio_path = os.path.join(temp_dir, f"audio_{scene_index}.mp3")
-    print(f"Downloading audio for scene {scene_index}...")
-    download_file(audio_url, audio_path)
-    
-    audio_size = os.path.getsize(audio_path)
-    print(f"Audio size: {audio_size} bytes")
-    if audio_size < 1000:
-        raise Exception(f"Audio download failed: {audio_size} bytes")
-    
-    # Get duration from local file
-    duration = get_audio_duration(audio_path)
-    print(f"Scene {scene_index} duration: {duration}s")
-    
-    num_images = len(scene['images'])
-    time_per_image = duration / num_images
-    
-    # Download images
-    image_paths = []
-    for i, img_url in enumerate(scene['images']):
-        img_path = os.path.join(temp_dir, f"img_{scene_index}_{i}.jpg")
-        download_file(img_url, img_path)
-        image_paths.append(img_path)
-    
-    # Process each image into a short clip separately (memory efficient)
-    scene_clips = []
-    for i, img_path in enumerate(image_paths):
-        clip_path = os.path.join(temp_dir, f"clip_{scene_index}_{i}.mp4")
-        
-        cmd = [
-            'ffmpeg', '-y',
-            '-loop', '1',
-            '-i', img_path,
-            '-t', str(time_per_image),
-            '-vf', 'scale=1280:720,setsar=1',
-            '-c:v', 'libx264',
-            '-preset', 'ultrafast',
-            '-crf', '28',
-            '-pix_fmt', 'yuv420p',
-            '-r', '24',
-            clip_path
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise Exception(f"Clip {i} failed: {result.stderr[-300:]}")
-        
-        scene_clips.append(clip_path)
-        print(f"Clip {i} done")
-    
-    # Concatenate all image clips into one video
-    clips_concat_file = os.path.join(temp_dir, f"clips_{scene_index}.txt")
-    with open(clips_concat_file, 'w') as f:
-        for clip_path in scene_clips:
-            f.write(f"file '{clip_path}'\n")
-    
-    video_only = os.path.join(temp_dir, f"video_only_{scene_index}.mp4")
-    cmd = [
-        'ffmpeg', '-y',
-        '-f', 'concat',
-        '-safe', '0',
-        '-i', clips_concat_file,
-        '-c', 'copy',
-        video_only
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise Exception(f"Clip concat failed: {result.stderr[-300:]}")
-    
-    # Add audio + text overlay
-    text = scene.get('text', '')
-    text = text.replace('\\', '\\\\')
-    text = text.replace("'", "\u2019")
-    text = text.replace(':', '\\:')
-    text = text.replace(',', '\\,')
-    
-    scene_output = os.path.join(temp_dir, f"scene_{scene_index}.mp4")
-    
-    cmd = [
-        'ffmpeg', '-y',
-        '-i', video_only,
-        '-i', audio_path,
-        '-vf', (
-            f"drawtext=text='{text}':"
-            f"fontsize=28:"
-            f"fontcolor=white:"
-            f"box=1:boxcolor=black@0.6:boxborderw=10:"
-            f"x=(w-text_w)/2:"
-            f"y=h-80"
-        ),
-        '-c:v', 'libx264',
-        '-preset', 'ultrafast',
-        '-crf', '28',
-        '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac',
-        '-shortest',
-        '-r', '24',
-        scene_output
-    ]
-    
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise Exception(f"FFmpeg failed (code {result.returncode}): {result.stderr[-800:]}")
-    
-    if not os.path.exists(scene_output) or os.path.getsize(scene_output) < 1000:
-        raise Exception(f"FFmpeg produced no output")
-    
-    # Cleanup intermediate files to free disk space
-    for clip_path in scene_clips:
-        os.remove(clip_path)
-    os.remove(video_only)
-    os.remove(clips_concat_file)
-    
-    print(f"Scene {scene_index} done: {os.path.getsize(scene_output)} bytes")
-    return scene_output
-
-def concatenate_scenes(scene_videos, output_path, temp_dir):
-    """Concatenate all scene MP4s into final video"""
-    
-    # Verify all scene files exist and have content
-    for i, video_path in enumerate(scene_videos):
-        if not os.path.exists(video_path):
-            raise Exception(f"Scene {i} file missing: {video_path}")
-        size = os.path.getsize(video_path)
-        print(f"Scene {i} file: {video_path} = {size} bytes")
-    
-    concat_file = os.path.join(temp_dir, 'concat.txt')
-    with open(concat_file, 'w') as f:
-        for video_path in scene_videos:
-            # Use absolute path to avoid any relative path issues
-            abs_path = os.path.abspath(video_path)
-            f.write(f"file '{abs_path}'\n")
-    
-    # Print concat file content for debugging
-    with open(concat_file, 'r') as f:
-        print("Concat file contents:")
-        print(f.read())
-    
-    cmd = [
-        'ffmpeg', '-y',
-        '-f', 'concat',
-        '-safe', '0',
-        '-i', concat_file,
-        '-c:v', 'libx264',
-        '-preset', 'ultrafast',
-        '-crf', '28',
-        '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac',
-        '-b:a', '128k',
-        output_path
-    ]
-    
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    
-    if result.returncode != 0:
-        raise Exception(f"Concat failed: {result.stderr[-500:]}")
-    
-    final_size = os.path.getsize(output_path)
-    print(f"Final video size: {final_size} bytes")
-    return output_path
-
-
 def process_video_job(job_id, scenes):
     """Background thread: generate video and store result"""
     
@@ -230,36 +63,178 @@ def process_video_job(job_id, scenes):
             jobs[job_id]['progress'] = f"Processing scene {i+1}/{len(scenes)}"
             print(f"Job {job_id}: Processing scene {i+1}/{len(scenes)}")
             scene_path = create_scene_video(scene, temp_dir, i)
-            
-            # Verify each scene is unique
-            print(f"Scene {i} path: {scene_path}")
-            print(f"Scene {i} size: {os.path.getsize(scene_path)} bytes")
+            print(f"Scene {i} path: {scene_path} size: {os.path.getsize(scene_path)}")
             scene_videos.append(scene_path)
-        
-        # Log all scene paths before concat
-        print("All scene paths:")
-        for i, p in enumerate(scene_videos):
-            print(f"  [{i}] {p} = {os.path.getsize(p)} bytes")
-        
+
         jobs[job_id]['progress'] = "Concatenating scenes..."
         final_output = os.path.join(temp_dir, 'final_video.mp4')
         concatenate_scenes(scene_videos, final_output, temp_dir)
-        
+
         file_size = os.path.getsize(final_output)
-        
         jobs[job_id]['status'] = 'done'
         jobs[job_id]['file_path'] = final_output
         jobs[job_id]['temp_dir'] = temp_dir
         jobs[job_id]['file_size_mb'] = round(file_size / 1024 / 1024, 2)
         jobs[job_id]['progress'] = "Done"
         print(f"Job {job_id} completed: {file_size} bytes")
-        
+
     except Exception as e:
         import traceback
         print(traceback.format_exc())
         jobs[job_id]['status'] = 'error'
         jobs[job_id]['error'] = str(e)
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def create_scene_video(scene, temp_dir, scene_index):
+    """Create MP4 for one scene - video only, audio added in concat"""
+
+    # ── 1. Download audio ──────────────────────────────────────────
+    audio_id = scene['audioFileId']
+    audio_url = (
+        f"https://drive.usercontent.google.com/download"
+        f"?id={audio_id}&export=download&confirm=t"
+    )
+    audio_path = os.path.join(temp_dir, f"audio_{scene_index}.mp3")
+    print(f"Downloading audio for scene {scene_index}...")
+    download_file(audio_url, audio_path)
+
+    audio_size = os.path.getsize(audio_path)
+    print(f"Audio size: {audio_size} bytes")
+    if audio_size < 1000:
+        raise Exception(f"Audio download failed: {audio_size} bytes")
+
+    # ── 2. Get duration ────────────────────────────────────────────
+    duration = get_audio_duration(audio_path)
+    print(f"Scene {scene_index} duration: {duration}s")
+    if duration < 1.0:
+        raise Exception(f"Audio duration too short: {duration}s")
+
+    num_images = len(scene['images'])
+    time_per_image = round(duration / num_images, 3)
+
+    # ── 3. Download images ─────────────────────────────────────────
+    image_paths = []
+    for i, img_url in enumerate(scene['images']):
+        img_path = os.path.join(temp_dir, f"img_{scene_index}_{i}.jpg")
+        download_file(img_url, img_path)
+        image_paths.append(img_path)
+
+    # ── 4. Create individual image clips ──────────────────────────
+    scene_clips = []
+    for i, img_path in enumerate(image_paths):
+        clip_path = os.path.join(temp_dir, f"clip_{scene_index}_{i}.mp4")
+        cmd = [
+            'ffmpeg', '-y',
+            '-loop', '1',
+            '-i', img_path,
+            '-t', str(time_per_image),
+            '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease,'
+                   'pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1',
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-tune', 'stillimage',
+            '-crf', '28',
+            '-pix_fmt', 'yuv420p',
+            '-r', '24',
+            clip_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise Exception(f"Clip {i} failed: {result.stderr[-400:]}")
+        scene_clips.append(clip_path)
+        print(f"Clip {i} done: {os.path.getsize(clip_path)} bytes")
+
+    # ── 5. Concat image clips into silent video ────────────────────
+    clips_concat_file = os.path.join(temp_dir, f"clips_{scene_index}.txt")
+    with open(clips_concat_file, 'w') as f:
+        for clip_path in scene_clips:
+            f.write(f"file '{os.path.abspath(clip_path)}'\n")
+
+    video_only = os.path.join(temp_dir, f"video_only_{scene_index}.mp4")
+    cmd = [
+        'ffmpeg', '-y',
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', clips_concat_file,
+        '-c', 'copy',
+        video_only
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Exception(f"Clip concat failed: {result.stderr[-300:]}")
+
+    # ── 6. Add audio to video ──────────────────────────────────────
+    scene_output = os.path.join(temp_dir, f"scene_{scene_index}.mp4")
+
+    cmd = [
+        'ffmpeg', '-y',
+        '-i', video_only,
+        '-i', audio_path,
+        '-map', '0:v:0',
+        '-map', '1:a:0',
+        '-c:v', 'copy',        # keep video as-is
+        '-c:a', 'aac',
+        '-b:a', '128k',
+        '-shortest',
+        scene_output
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Exception(f"Audio merge failed: {result.stderr[-500:]}")
+
+    if not os.path.exists(scene_output) or os.path.getsize(scene_output) < 1000:
+        raise Exception("Scene output empty")
+
+    # Cleanup
+    for clip_path in scene_clips:
+        os.remove(clip_path)
+    os.remove(video_only)
+    os.remove(clips_concat_file)
+
+    print(f"Scene {scene_index} done: {os.path.getsize(scene_output)} bytes")
+    return scene_output
+
+
+def concatenate_scenes(scene_videos, output_path, temp_dir):
+    """Concatenate all scene MP4s into final video"""
+
+    # Verify files
+    for i, video_path in enumerate(scene_videos):
+        size = os.path.getsize(video_path)
+        print(f"Scene {i}: {video_path} = {size} bytes")
+
+    concat_file = os.path.join(temp_dir, 'concat.txt')
+    with open(concat_file, 'w') as f:
+        for video_path in scene_videos:
+            f.write(f"file '{os.path.abspath(video_path)}'\n")
+
+    print("Concat file:")
+    with open(concat_file) as f:
+        print(f.read())
+
+    # Re-encode to ensure proper stream merging
+    cmd = [
+        'ffmpeg', '-y',
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', concat_file,
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-crf', '28',
+        '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac',
+        '-b:a', '128k',
+        output_path
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Exception(f"Concat failed: {result.stderr[-500:]}")
+
+    print(f"Final video: {os.path.getsize(output_path)} bytes")
+    return output_path
 
 @app.route('/test-audio/<file_id>', methods=['GET'])
 def test_audio(file_id):

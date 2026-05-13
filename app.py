@@ -13,20 +13,35 @@ sys.stdout.reconfigure(line_buffering=True)
 app = Flask(__name__)
 jobs = {}
 
-
 def download_file(url, dest_path):
+    import time
     session = requests.Session()
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {
+        'User-Agent': 'Mozilla/5.0',
+        'Cache-Control': 'no-cache, no-store',
+        'Pragma': 'no-cache'
+    }
+    
+    # Add cache-busting timestamp
+    separator = '&' if '?' in url else '?'
+    url = f"{url}{separator}t={int(time.time() * 1000)}"
+    
     response = session.get(url, headers=headers, stream=True, allow_redirects=True)
+    
     for key, value in response.cookies.items():
         if key.startswith('download_warning'):
             url = url + f"&confirm={value}"
             response = session.get(url, headers=headers, stream=True, allow_redirects=True)
             break
+    
     with open(dest_path, 'wb') as f:
         for chunk in response.iter_content(chunk_size=32768):
             if chunk:
                 f.write(chunk)
+    
+    # Log what we actually got
+    file_size = os.path.getsize(dest_path)
+    print(f"Downloaded {url[:80]}... → {file_size} bytes")
     return dest_path
 
 
@@ -45,49 +60,89 @@ def get_audio_duration(audio_path):
 
 
 def create_scene_video(scene, temp_dir, scene_index):
+    import time
+
+    # ── 1. Download audio ──────────────────────────────────────────
     audio_id = scene['audioFileId']
-    audio_url = f"https://drive.usercontent.google.com/download?id={audio_id}&export=download&confirm=t"
-    audio_path = os.path.join(temp_dir, f"audio_{scene_index}.mp3")
-    print(f"[Scene {scene_index}] Downloading audio: {audio_id}")
+    
+    # Use unique URL per scene to avoid Google Drive CDN caching
+    audio_url = (
+        f"https://drive.usercontent.google.com/download"
+        f"?id={audio_id}&export=download&confirm=t&uuid={uuid.uuid4()}&t={int(time.time())}"
+    )
+    
+    # Use audio_id in filename to ensure uniqueness
+    audio_path = os.path.join(temp_dir, f"audio_{scene_index}_{audio_id}.mp3")
+    
+    print(f"[Scene {scene_index}] Downloading audio ID: {audio_id}")
+    print(f"[Scene {scene_index}] Audio URL: {audio_url[:80]}...")
     download_file(audio_url, audio_path)
 
     audio_size = os.path.getsize(audio_path)
     print(f"[Scene {scene_index}] Audio size: {audio_size} bytes")
     if audio_size < 1000:
-        raise Exception(f"Audio too small: {audio_size} bytes")
+        raise Exception(f"Audio too small: {audio_size} bytes - likely wrong file")
 
+    # Validate it's actually MP3 not HTML
+    with open(audio_path, 'rb') as f:
+        header = f.read(10)
+    print(f"[Scene {scene_index}] Audio header: {header[:4].hex()}")
+    if b'<' in header[:5]:
+        raise Exception(f"Audio download returned HTML, not MP3. Header: {header}")
+
+    # ── 2. Get duration ────────────────────────────────────────────
     duration = get_audio_duration(audio_path)
     print(f"[Scene {scene_index}] Duration: {duration}s")
     if duration < 0.5:
         raise Exception(f"Duration too short: {duration}s")
 
+    # ── 3. Download images ─────────────────────────────────────────
     images = scene.get('images', [])
     num_images = len(images)
     time_per_image = round(duration / num_images, 3)
+    print(f"[Scene {scene_index}] {num_images} images, {time_per_image}s each")
 
     image_paths = []
     for i, img_url in enumerate(images):
         img_path = os.path.join(temp_dir, f"img_{scene_index}_{i}.jpg")
         download_file(img_url, img_path)
+        img_size = os.path.getsize(img_path)
+        print(f"[Scene {scene_index}] Image {i}: {img_size} bytes")
+        if img_size < 500:
+            raise Exception(f"Image {i} too small: {img_size} bytes")
         image_paths.append(img_path)
 
+    # ── 4. Create individual image clips ──────────────────────────
     clip_paths = []
     for i, img_path in enumerate(image_paths):
         clip_path = os.path.join(temp_dir, f"clip_{scene_index}_{i}.mp4")
         cmd = [
             'ffmpeg', '-y',
-            '-loop', '1', '-i', img_path,
+            '-loop', '1',
+            '-i', img_path,
             '-t', str(time_per_image),
-            '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1',
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage',
-            '-crf', '28', '-pix_fmt', 'yuv420p', '-r', '24', '-an',
+            '-vf', (
+                'scale=1280:720:'
+                'force_original_aspect_ratio=decrease,'
+                'pad=1280:720:(ow-iw)/2:(oh-ih)/2,'
+                'setsar=1'
+            ),
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-tune', 'stillimage',
+            '-crf', '28',
+            '-pix_fmt', 'yuv420p',
+            '-r', '24',
+            '-an',  # no audio in clips
             clip_path
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise Exception(f"Clip {i} failed: {result.stderr[-300:]}")
+        print(f"[Scene {scene_index}] Clip {i}: {os.path.getsize(clip_path)} bytes")
         clip_paths.append(clip_path)
 
+    # ── 5. Concat image clips into silent video ────────────────────
     concat_file = os.path.join(temp_dir, f"concat_{scene_index}.txt")
     with open(concat_file, 'w') as f:
         for cp in clip_paths:
@@ -96,21 +151,29 @@ def create_scene_video(scene, temp_dir, scene_index):
     silent_video = os.path.join(temp_dir, f"silent_{scene_index}.mp4")
     cmd = [
         'ffmpeg', '-y',
-        '-f', 'concat', '-safe', '0', '-i', concat_file,
-        '-c', 'copy', '-an',
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', concat_file,
+        '-c', 'copy',
+        '-an',  # ensure no audio
         silent_video
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise Exception(f"Silent concat failed: {result.stderr[-300:]}")
+    print(f"[Scene {scene_index}] Silent video: {os.path.getsize(silent_video)} bytes")
 
+    # ── 6. Merge video + audio ─────────────────────────────────────
     scene_output = os.path.join(temp_dir, f"scene_{scene_index}.mp4")
     cmd = [
         'ffmpeg', '-y',
         '-i', silent_video,
         '-i', audio_path,
-        '-map', '0:v:0', '-map', '1:a:0',
-        '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k',
+        '-map', '0:v:0',
+        '-map', '1:a:0',
+        '-c:v', 'copy',
+        '-c:a', 'aac',
+        '-b:a', '128k',
         '-shortest',
         scene_output
     ]
@@ -119,17 +182,20 @@ def create_scene_video(scene, temp_dir, scene_index):
         raise Exception(f"Audio merge failed: {result.stderr[-400:]}")
 
     scene_size = os.path.getsize(scene_output)
-    print(f"[Scene {scene_index}] Done: {scene_size} bytes")
+    print(f"[Scene {scene_index}] Final scene: {scene_size} bytes")
     if scene_size < 1000:
-        raise Exception(f"Scene empty: {scene_size} bytes")
+        raise Exception(f"Scene output empty: {scene_size} bytes")
 
+    # ── 7. Cleanup intermediate files ─────────────────────────────
     for cp in clip_paths:
-        if os.path.exists(cp): os.remove(cp)
-    if os.path.exists(silent_video): os.remove(silent_video)
-    if os.path.exists(concat_file): os.remove(concat_file)
+        if os.path.exists(cp):
+            os.remove(cp)
+    if os.path.exists(silent_video):
+        os.remove(silent_video)
+    if os.path.exists(concat_file):
+        os.remove(concat_file)
 
     return scene_output
-
 
 def concatenate_scenes(scene_videos, output_path, temp_dir):
     print("=== Concatenating scenes ===")

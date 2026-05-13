@@ -171,29 +171,49 @@ def create_scene_video(scene, temp_dir, scene_index):
     print(f"Scene {scene_index} done: {os.path.getsize(scene_output)} bytes")
     return scene_output
 
-
 def concatenate_scenes(scene_videos, output_path, temp_dir):
     """Concatenate all scene MP4s into final video"""
+    
+    # Verify all scene files exist and have content
+    for i, video_path in enumerate(scene_videos):
+        if not os.path.exists(video_path):
+            raise Exception(f"Scene {i} file missing: {video_path}")
+        size = os.path.getsize(video_path)
+        print(f"Scene {i} file: {video_path} = {size} bytes")
     
     concat_file = os.path.join(temp_dir, 'concat.txt')
     with open(concat_file, 'w') as f:
         for video_path in scene_videos:
-            f.write(f"file '{video_path}'\n")
+            # Use absolute path to avoid any relative path issues
+            abs_path = os.path.abspath(video_path)
+            f.write(f"file '{abs_path}'\n")
+    
+    # Print concat file content for debugging
+    with open(concat_file, 'r') as f:
+        print("Concat file contents:")
+        print(f.read())
     
     cmd = [
         'ffmpeg', '-y',
         '-f', 'concat',
         '-safe', '0',
         '-i', concat_file,
-        '-c', 'copy',
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-crf', '28',
+        '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac',
+        '-b:a', '128k',
         output_path
     ]
     
     result = subprocess.run(cmd, capture_output=True, text=True)
+    
     if result.returncode != 0:
         raise Exception(f"Concat failed: {result.stderr[-500:]}")
     
-    print(f"Final video size: {os.path.getsize(output_path)} bytes")
+    final_size = os.path.getsize(output_path)
+    print(f"Final video size: {final_size} bytes")
     return output_path
 
 
@@ -210,7 +230,16 @@ def process_video_job(job_id, scenes):
             jobs[job_id]['progress'] = f"Processing scene {i+1}/{len(scenes)}"
             print(f"Job {job_id}: Processing scene {i+1}/{len(scenes)}")
             scene_path = create_scene_video(scene, temp_dir, i)
+            
+            # Verify each scene is unique
+            print(f"Scene {i} path: {scene_path}")
+            print(f"Scene {i} size: {os.path.getsize(scene_path)} bytes")
             scene_videos.append(scene_path)
+        
+        # Log all scene paths before concat
+        print("All scene paths:")
+        for i, p in enumerate(scene_videos):
+            print(f"  [{i}] {p} = {os.path.getsize(p)} bytes")
         
         jobs[job_id]['progress'] = "Concatenating scenes..."
         final_output = os.path.join(temp_dir, 'final_video.mp4')

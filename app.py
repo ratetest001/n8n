@@ -356,6 +356,17 @@ def health():
         "active_jobs": len(jobs)
     })
 
+@app.route('/debug', methods=['POST'])
+def debug():
+    data = request.json
+    return jsonify({
+        "received_type": type(data).__name__,
+        "is_list": isinstance(data, list),
+        "length": len(data) if isinstance(data, list) else None,
+        "first_item_keys": list(data[0].keys()) if isinstance(data, list) and len(data) > 0 else None,
+        "raw_preview": str(data)[:500]
+    })
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))

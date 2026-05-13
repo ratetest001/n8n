@@ -6,6 +6,9 @@ import tempfile
 import threading
 import uuid
 import shutil
+import sys
+# Force stdout to flush immediately
+sys.stdout.reconfigure(line_buffering=True)
 
 app = Flask(__name__)
 jobs = {}
@@ -191,13 +194,20 @@ def process_video_job(job_id, scenes):
         jobs[job_id]['error'] = str(e)
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-
 @app.route('/generate-video', methods=['POST'])
 def generate_video():
     try:
         scenes = request.json
+        
+        # Log immediately before anything else
+        print(f"Received request. Type: {type(scenes)}, Length: {len(scenes) if isinstance(scenes, list) else 'N/A'}")
+        
         if not scenes or not isinstance(scenes, list):
             return jsonify({"success": False, "error": "Invalid input"}), 400
+
+        # Log scene summary
+        for i, scene in enumerate(scenes):
+            print(f"  Input scene {i}: audioFileId={scene.get('audioFileId')}, sceneIndex={scene.get('sceneIndex')}")
 
         job_id = str(uuid.uuid4())
         jobs[job_id] = {
@@ -206,11 +216,14 @@ def generate_video():
             "temp_dir": None, "error": None
         }
 
+        print(f"Starting job {job_id} with {len(scenes)} scenes")
+
         thread = threading.Thread(
             target=process_video_job,
             args=(job_id, scenes), daemon=True
         )
         thread.start()
+        print(f"Thread started for job {job_id}")
 
         return jsonify({
             "success": True, "job_id": job_id,
@@ -219,8 +232,9 @@ def generate_video():
         })
 
     except Exception as e:
+        import traceback
+        print(f"Error in generate_video: {traceback.format_exc()}")
         return jsonify({"success": False, "error": str(e)}), 500
-
 
 @app.route('/status/<job_id>', methods=['GET'])
 def get_status(job_id):

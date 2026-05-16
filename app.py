@@ -95,7 +95,8 @@ def transcribe_audio_to_srt_blocks(audio_path: str, start_offset_sec: float) -> 
             file=f,
             response_format="verbose_json",
             timestamp_granularities=["segment"],
-            prompt="Transcribe in Roman/Latin script only. Write Hindi words as they sound in English letters. Example: Namaste dosto, aaj hum baat karenge"
+            language="en",  # Force English/Roman script output for Hinglish
+            prompt="Namaste dosto, aaj hum baat karenge un news ko leke. Ab baat karte hai."
         )
 
     blocks = []
@@ -227,27 +228,22 @@ def create_scene_video(scene, temp_dir, scene_index):
             raise Exception(f"Image {i} too small: {img_size} bytes")
         image_paths.append(img_path)
 
-    # ── 4. Create individual image clips with Ken Burns effect ──────
-    # Alternating zoom-in / zoom-out / pan-left / pan-right per clip
-    ken_burns_effects = [
-        # Zoom in from center
-        "scale=8000:-1,zoompan=z='min(zoom+0.0015,1.3)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1280x720:fps=24",
-        # Zoom out from center
-        "scale=8000:-1,zoompan=z='if(lte(zoom,1.0),1.3,max(1.0,zoom-0.0015))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1280x720:fps=24",
-        # Pan left to right with slight zoom
-        "scale=8000:-1,zoompan=z='1.15':x='if(lte(on,1),0,x+1.2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1280x720:fps=24",
-        # Pan right to left with slight zoom
-        "scale=8000:-1,zoompan=z='1.15':x='if(lte(on,1),iw,x-1.2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1280x720:fps=24",
-    ]
-
+    # ── 4. Create individual image clips with zoom in+out (breathe) effect ──
     clip_paths = []
     for i, img_path in enumerate(image_paths):
         clip_path = os.path.join(temp_dir, f"clip_{scene_index}_{i}.mp4")
-        frames = int(time_per_image * 24)  # 24 fps
+        frames = int(time_per_image * 24)  # total frames at 24fps
+        half = frames // 2
 
-        # Pick effect — cycle through the 4 options
-        effect_template = ken_burns_effects[i % len(ken_burns_effects)]
-        effect = effect_template.replace("{frames}", str(frames))
+        # Zoom in for first half, zoom out for second half — smooth breathe effect
+        # Each image scales up from 1.0 to 1.2 then back to 1.0
+        effect = (
+            "scale=8000:-1,"
+            f"zoompan=z='if(lte(on,{half}),1.0+(on/{half})*0.2,1.2-((on-{half})/{half})*0.2)':"
+            "x='iw/2-(iw/zoom/2)':"
+            "y='ih/2-(ih/zoom/2)':"
+            f"d={frames}:s=1280x720:fps=24"
+        )
 
         cmd = [
             'ffmpeg', '-y',

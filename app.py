@@ -468,16 +468,29 @@ def echo():
     return jsonify(summary)
 
 
+# @app.route('/health', methods=['GET'])
+# def health():
+#     return jsonify({
+#         "status": "ok",
+#         "ffmpeg": shutil.which('ffmpeg') or "NOT FOUND",
+#         "ffprobe": shutil.which('ffprobe') or "NOT FOUND",
+#         "openai_key_set": bool(os.environ.get("OPENAI_API_KEY")),
+#         "active_jobs": len(jobs)
+#     })
 @app.route('/health', methods=['GET'])
 def health():
+    import os
+    # Dump ALL environment variables to find the key
+    all_env = {k: v[:10] + '...' if 'KEY' in k.upper() or 'SECRET' in k.upper() or 'TOKEN' in k.upper() else v 
+               for k, v in os.environ.items()}
     return jsonify({
         "status": "ok",
         "ffmpeg": shutil.which('ffmpeg') or "NOT FOUND",
         "ffprobe": shutil.which('ffprobe') or "NOT FOUND",
         "openai_key_set": bool(os.environ.get("OPENAI_API_KEY")),
+        "all_env": all_env,
         "active_jobs": len(jobs)
     })
-
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))

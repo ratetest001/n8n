@@ -95,7 +95,7 @@ def transcribe_audio_to_srt_blocks(audio_path: str, start_offset_sec: float) -> 
             file=f,
             response_format="verbose_json",
             timestamp_granularities=["segment"],
-            language="hi"  # Hindi/Hinglish — remove for auto-detect
+            prompt="Transcribe in Roman/Latin script only. Write Hindi words as they sound in English letters. Example: Namaste dosto, aaj hum baat karenge"
         )
 
     blocks = []

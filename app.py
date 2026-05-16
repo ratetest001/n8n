@@ -7,11 +7,16 @@ import threading
 import uuid
 import shutil
 import sys
-# Force stdout to flush immediately
+
 sys.stdout.reconfigure(line_buffering=True)
 
 app = Flask(__name__)
 jobs = {}
+
+
+# ─────────────────────────────────────────────
+#  HELPERS
+# ─────────────────────────────────────────────
 
 def download_file(url, dest_path):
     import time
@@ -21,25 +26,18 @@ def download_file(url, dest_path):
         'Cache-Control': 'no-cache, no-store',
         'Pragma': 'no-cache'
     }
-    
-    # Add cache-busting timestamp
     separator = '&' if '?' in url else '?'
     url = f"{url}{separator}t={int(time.time() * 1000)}"
-    
     response = session.get(url, headers=headers, stream=True, allow_redirects=True)
-    
     for key, value in response.cookies.items():
         if key.startswith('download_warning'):
             url = url + f"&confirm={value}"
             response = session.get(url, headers=headers, stream=True, allow_redirects=True)
             break
-    
     with open(dest_path, 'wb') as f:
         for chunk in response.iter_content(chunk_size=32768):
             if chunk:
                 f.write(chunk)
-    
-    # Log what we actually got
     file_size = os.path.getsize(dest_path)
     print(f"Downloaded {url[:80]}... → {file_size} bytes")
     return dest_path
@@ -59,23 +57,99 @@ def get_audio_duration(audio_path):
     return float(output)
 
 
+def ms_to_srt_time(ms: float) -> str:
+    """Convert milliseconds to SRT timestamp HH:MM:SS,mmm"""
+    ms = int(ms)
+    hours = ms // 3_600_000
+    ms %= 3_600_000
+    minutes = ms // 60_000
+    ms %= 60_000
+    seconds = ms // 1_000
+    millis = ms % 1_000
+    return f"{hours:02}:{minutes:02}:{seconds:02},{millis:03}"
+
+
+def generate_srt_for_scenes(scenes_with_durations: list[dict]) -> str:
+    """
+    Build a single SRT file for all scenes.
+    scenes_with_durations: [{ 'text': str, 'duration_ms': float, 'start_ms': float }]
+    Splits each scene's text into ~10-word chunks for readability.
+    """
+    srt_blocks = []
+    index = 1
+
+    for scene in scenes_with_durations:
+        text = scene['text'].strip()
+        start_ms = scene['start_ms']
+        duration_ms = scene['duration_ms']
+
+        if not text:
+            continue
+
+        # Split into chunks of ~10 words so subtitles are readable
+        words = text.split()
+        chunk_size = 10
+        chunks = [words[i:i+chunk_size] for i in range(0, len(words), chunk_size)]
+        chunk_duration_ms = duration_ms / len(chunks)
+
+        for j, chunk in enumerate(chunks):
+            chunk_start = start_ms + j * chunk_duration_ms
+            chunk_end = start_ms + (j + 1) * chunk_duration_ms
+            srt_blocks.append(f"{index}")
+            srt_blocks.append(f"{ms_to_srt_time(chunk_start)} --> {ms_to_srt_time(chunk_end)}")
+            srt_blocks.append(" ".join(chunk))
+            srt_blocks.append("")
+            index += 1
+
+    return "\n".join(srt_blocks)
+
+
+def burn_subtitles(video_path: str, srt_path: str, output_path: str):
+    """Burn SRT subtitles into video using FFmpeg."""
+    # Escape path for FFmpeg subtitle filter (Windows-safe too)
+    escaped_srt = srt_path.replace('\\', '/').replace(':', '\\:')
+
+    cmd = [
+        'ffmpeg', '-y',
+        '-i', video_path,
+        '-vf', (
+            f"subtitles='{escaped_srt}':force_style='"
+            "FontName=Arial,"
+            "FontSize=18,"
+            "PrimaryColour=&H00FFFFFF,"   # white text
+            "OutlineColour=&H00000000,"   # black outline
+            "BackColour=&H80000000,"      # semi-transparent background
+            "Outline=2,"
+            "Shadow=1,"
+            "Alignment=2,"               # bottom center
+            "MarginV=30"
+            "'"
+        ),
+        '-c:a', 'copy',
+        output_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Exception(f"Subtitle burn failed: {result.stderr[-500:]}")
+    print(f"Subtitles burned → {os.path.getsize(output_path)} bytes")
+    return output_path
+
+
+# ─────────────────────────────────────────────
+#  SCENE PROCESSING
+# ─────────────────────────────────────────────
+
 def create_scene_video(scene, temp_dir, scene_index):
     import time
 
     # ── 1. Download audio ──────────────────────────────────────────
     audio_id = scene['audioFileId']
-    
-    # Use unique URL per scene to avoid Google Drive CDN caching
     audio_url = (
         f"https://drive.usercontent.google.com/download"
         f"?id={audio_id}&export=download&confirm=t&uuid={uuid.uuid4()}&t={int(time.time())}"
     )
-    
-    # Use audio_id in filename to ensure uniqueness
     audio_path = os.path.join(temp_dir, f"audio_{scene_index}_{audio_id}.mp3")
-    
     print(f"[Scene {scene_index}] Downloading audio ID: {audio_id}")
-    print(f"[Scene {scene_index}] Audio URL: {audio_url[:80]}...")
     download_file(audio_url, audio_path)
 
     audio_size = os.path.getsize(audio_path)
@@ -83,7 +157,6 @@ def create_scene_video(scene, temp_dir, scene_index):
     if audio_size < 1000:
         raise Exception(f"Audio too small: {audio_size} bytes - likely wrong file")
 
-    # Validate it's actually MP3 not HTML
     with open(audio_path, 'rb') as f:
         header = f.read(10)
     print(f"[Scene {scene_index}] Audio header: {header[:4].hex()}")
@@ -133,7 +206,7 @@ def create_scene_video(scene, temp_dir, scene_index):
             '-crf', '28',
             '-pix_fmt', 'yuv420p',
             '-r', '24',
-            '-an',  # no audio in clips
+            '-an',
             clip_path
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -151,17 +224,13 @@ def create_scene_video(scene, temp_dir, scene_index):
     silent_video = os.path.join(temp_dir, f"silent_{scene_index}.mp4")
     cmd = [
         'ffmpeg', '-y',
-        '-f', 'concat',
-        '-safe', '0',
-        '-i', concat_file,
-        '-c', 'copy',
-        '-an',  # ensure no audio
+        '-f', 'concat', '-safe', '0', '-i', concat_file,
+        '-c', 'copy', '-an',
         silent_video
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise Exception(f"Silent concat failed: {result.stderr[-300:]}")
-    print(f"[Scene {scene_index}] Silent video: {os.path.getsize(silent_video)} bytes")
 
     # ── 6. Merge video + audio ─────────────────────────────────────
     scene_output = os.path.join(temp_dir, f"scene_{scene_index}.mp4")
@@ -169,11 +238,9 @@ def create_scene_video(scene, temp_dir, scene_index):
         'ffmpeg', '-y',
         '-i', silent_video,
         '-i', audio_path,
-        '-map', '0:v:0',
-        '-map', '1:a:0',
+        '-map', '0:v:0', '-map', '1:a:0',
         '-c:v', 'copy',
-        '-c:a', 'aac',
-        '-b:a', '128k',
+        '-c:a', 'aac', '-b:a', '128k',
         '-shortest',
         scene_output
     ]
@@ -186,16 +253,19 @@ def create_scene_video(scene, temp_dir, scene_index):
     if scene_size < 1000:
         raise Exception(f"Scene output empty: {scene_size} bytes")
 
-    # ── 7. Cleanup intermediate files ─────────────────────────────
+    # ── 7. Cleanup intermediates ───────────────────────────────────
     for cp in clip_paths:
-        if os.path.exists(cp):
-            os.remove(cp)
-    if os.path.exists(silent_video):
-        os.remove(silent_video)
-    if os.path.exists(concat_file):
-        os.remove(concat_file)
+        if os.path.exists(cp): os.remove(cp)
+    if os.path.exists(silent_video): os.remove(silent_video)
+    if os.path.exists(concat_file): os.remove(concat_file)
 
-    return scene_output
+    # Return scene output + duration (needed for SRT timing)
+    return scene_output, duration
+
+
+# ─────────────────────────────────────────────
+#  CONCATENATION + SUBTITLE BURN
+# ─────────────────────────────────────────────
 
 def concatenate_scenes(scene_videos, output_path, temp_dir):
     print("=== Concatenating scenes ===")
@@ -223,25 +293,64 @@ def concatenate_scenes(scene_videos, output_path, temp_dir):
     return output_path
 
 
+# ─────────────────────────────────────────────
+#  JOB PROCESSOR
+# ─────────────────────────────────────────────
+
 def process_video_job(job_id, scenes):
     temp_dir = tempfile.mkdtemp(prefix=f"job_{job_id}_")
     try:
         jobs[job_id]['status'] = 'processing'
         print(f"Job {job_id}: Total scenes = {len(scenes)}")
 
-        # Log all scene audioFileIds upfront
         for i, scene in enumerate(scenes):
             print(f"  Scene {i}: audioFileId={scene.get('audioFileId')} sceneIndex={scene.get('sceneIndex')}")
 
+        # ── Process each scene, collect durations for SRT ──────────
         scene_videos = []
+        scene_durations = []   # in seconds, one per scene
+
         for i, scene in enumerate(scenes):
             jobs[job_id]['progress'] = f"Processing scene {i+1}/{len(scenes)}"
-            scene_path = create_scene_video(scene, temp_dir, i)
+            scene_path, duration = create_scene_video(scene, temp_dir, i)
             scene_videos.append(scene_path)
+            scene_durations.append(duration)
 
-        jobs[job_id]['progress'] = "Concatenating..."
+        # ── Concatenate all scenes ──────────────────────────────────
+        jobs[job_id]['progress'] = "Concatenating scenes..."
+        raw_output = os.path.join(temp_dir, 'raw_video.mp4')
+        concatenate_scenes(scene_videos, raw_output, temp_dir)
+
+        # ── Generate SRT from scene texts + durations ───────────────
+        jobs[job_id]['progress'] = "Generating subtitles..."
+        scenes_with_durations = []
+        cursor_ms = 0.0
+        for i, scene in enumerate(scenes):
+            text = scene.get('text', '').strip()
+            duration_ms = scene_durations[i] * 1000
+            scenes_with_durations.append({
+                'text': text,
+                'start_ms': cursor_ms,
+                'duration_ms': duration_ms
+            })
+            cursor_ms += duration_ms
+
+        srt_content = generate_srt_for_scenes(scenes_with_durations)
+        srt_path = os.path.join(temp_dir, 'subtitles.srt')
+        with open(srt_path, 'w', encoding='utf-8') as f:
+            f.write(srt_content)
+        print(f"SRT generated: {len(srt_content)} chars, {srt_content.count('-->') } blocks")
+
+        # ── Burn subtitles into final video ─────────────────────────
+        jobs[job_id]['progress'] = "Burning subtitles..."
         final_output = os.path.join(temp_dir, 'final_video.mp4')
-        concatenate_scenes(scene_videos, final_output, temp_dir)
+
+        if srt_content.strip():
+            burn_subtitles(raw_output, srt_path, final_output)
+        else:
+            # No text provided in any scene — skip subtitle burn
+            print("No subtitle text found, skipping burn step.")
+            shutil.copy(raw_output, final_output)
 
         file_size = os.path.getsize(final_output)
         jobs[job_id].update({
@@ -260,20 +369,22 @@ def process_video_job(job_id, scenes):
         jobs[job_id]['error'] = str(e)
         shutil.rmtree(temp_dir, ignore_errors=True)
 
+
+# ─────────────────────────────────────────────
+#  ROUTES
+# ─────────────────────────────────────────────
+
 @app.route('/generate-video', methods=['POST'])
 def generate_video():
     try:
         scenes = request.json
-        
-        # Log immediately before anything else
         print(f"Received request. Type: {type(scenes)}, Length: {len(scenes) if isinstance(scenes, list) else 'N/A'}")
-        
+
         if not scenes or not isinstance(scenes, list):
             return jsonify({"success": False, "error": "Invalid input"}), 400
 
-        # Log scene summary
         for i, scene in enumerate(scenes):
-            print(f"  Input scene {i}: audioFileId={scene.get('audioFileId')}, sceneIndex={scene.get('sceneIndex')}")
+            print(f"  Input scene {i}: audioFileId={scene.get('audioFileId')}, sceneIndex={scene.get('sceneIndex')}, text_preview={scene.get('text', '')[:60]}")
 
         job_id = str(uuid.uuid4())
         jobs[job_id] = {
@@ -283,11 +394,7 @@ def generate_video():
         }
 
         print(f"Starting job {job_id} with {len(scenes)} scenes")
-
-        thread = threading.Thread(
-            target=process_video_job,
-            args=(job_id, scenes), daemon=True
-        )
+        thread = threading.Thread(target=process_video_job, args=(job_id, scenes), daemon=True)
         thread.start()
         print(f"Thread started for job {job_id}")
 
@@ -301,6 +408,7 @@ def generate_video():
         import traceback
         print(f"Error in generate_video: {traceback.format_exc()}")
         return jsonify({"success": False, "error": str(e)}), 500
+
 
 @app.route('/status/<job_id>', methods=['GET'])
 def get_status(job_id):

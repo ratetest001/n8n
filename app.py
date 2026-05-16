@@ -120,7 +120,6 @@ def build_srt(all_blocks: list) -> str:
         srt_lines.append("")
     return "\n".join(srt_lines)
 
-
 def burn_subtitles(video_path: str, srt_path: str, output_path: str):
     """Burn SRT subtitles into video using FFmpeg."""
     escaped_srt = srt_path.replace('\\', '/').replace(':', '\\:')
@@ -130,14 +129,14 @@ def burn_subtitles(video_path: str, srt_path: str, output_path: str):
         '-i', video_path,
         '-vf', (
             f"subtitles='{escaped_srt}':force_style='"
-            "FontName=Arial,"
+            "FontName=Noto Sans Devanagari,"
             "FontSize=18,"
-            "PrimaryColour=&H00FFFFFF,"    # white text
-            "OutlineColour=&H00000000,"    # black outline
-            "BackColour=&H80000000,"       # semi-transparent black background
+            "PrimaryColour=&H00FFFFFF,"
+            "OutlineColour=&H00000000,"
+            "BackColour=&H80000000,"
             "Outline=2,"
             "Shadow=1,"
-            "Alignment=2,"                 # bottom center
+            "Alignment=2,"
             "MarginV=30"
             "'"
         ),
@@ -149,7 +148,6 @@ def burn_subtitles(video_path: str, srt_path: str, output_path: str):
         raise Exception(f"Subtitle burn failed: {result.stderr[-500:]}")
     print(f"Subtitles burned → {os.path.getsize(output_path)} bytes")
     return output_path
-
 
 # ─────────────────────────────────────────────
 #  SCENE PROCESSING
@@ -479,16 +477,13 @@ def echo():
 #     })
 @app.route('/health', methods=['GET'])
 def health():
-    import os
-    # Dump ALL environment variables to find the key
-    all_env = {k: v[:10] + '...' if 'KEY' in k.upper() or 'SECRET' in k.upper() or 'TOKEN' in k.upper() else v 
-               for k, v in os.environ.items()}
+    font_check = subprocess.run(['fc-list', ':lang=hi'], capture_output=True, text=True)
     return jsonify({
         "status": "ok",
         "ffmpeg": shutil.which('ffmpeg') or "NOT FOUND",
         "ffprobe": shutil.which('ffprobe') or "NOT FOUND",
         "openai_key_set": bool(os.environ.get("OPENAI_API_KEY")),
-        "all_env": all_env,
+        "hindi_fonts": font_check.stdout.strip().split('\n')[:5],  # shows first 5 Hindi fonts
         "active_jobs": len(jobs)
     })
 

@@ -14,8 +14,17 @@ sys.stdout.reconfigure(line_buffering=True)
 app = Flask(__name__)
 jobs = {}
 
-# OpenAI client — set OPENAI_API_KEY in Railway environment variables
-openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+# Lazy OpenAI client — initialized on first use, not at startup
+openai_client = None
+
+def get_openai_client():
+    global openai_client
+    if openai_client is None:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise Exception("OPENAI_API_KEY environment variable is not set in Railway")
+        openai_client = OpenAI(api_key=api_key)
+    return openai_client
 
 
 # ─────────────────────────────────────────────
@@ -73,14 +82,15 @@ def ms_to_srt_time(ms: float) -> str:
     return f"{hours:02}:{minutes:02}:{seconds:02},{millis:03}"
 
 
-def transcribe_audio_to_srt_blocks(audio_path: str, start_offset_sec: float) -> list[dict]:
+def transcribe_audio_to_srt_blocks(audio_path: str, start_offset_sec: float) -> list:
     """
     Send audio to OpenAI Whisper API with verbose_json to get segments with timestamps.
     Returns list of { start_ms, end_ms, text } dicts offset by start_offset_sec.
     """
     print(f"  [Whisper] Transcribing {os.path.basename(audio_path)} (offset: {start_offset_sec:.2f}s)...")
+    client = get_openai_client()
     with open(audio_path, 'rb') as f:
-        response = openai_client.audio.transcriptions.create(
+        response = client.audio.transcriptions.create(
             model="whisper-1",
             file=f,
             response_format="verbose_json",
@@ -100,7 +110,7 @@ def transcribe_audio_to_srt_blocks(audio_path: str, start_offset_sec: float) -> 
     return blocks
 
 
-def build_srt(all_blocks: list[dict]) -> str:
+def build_srt(all_blocks: list) -> str:
     """Convert list of { start_ms, end_ms, text } into SRT string."""
     srt_lines = []
     for i, block in enumerate(all_blocks, start=1):
@@ -265,7 +275,7 @@ def create_scene_video(scene, temp_dir, scene_index):
     if os.path.exists(silent_video): os.remove(silent_video)
     if os.path.exists(concat_file): os.remove(concat_file)
 
-    # Return scene path + duration + audio path (audio needed for Whisper)
+    # Return scene path + duration + audio path (audio kept for Whisper)
     return scene_output, duration, audio_path
 
 
@@ -313,9 +323,9 @@ def process_video_job(job_id, scenes):
             print(f"  Scene {i}: audioFileId={scene.get('audioFileId')} sceneIndex={scene.get('sceneIndex')}")
 
         # ── Process each scene ─────────────────────────────────────
-        scene_videos  = []
+        scene_videos    = []
         scene_durations = []
-        audio_paths   = []
+        audio_paths     = []
 
         for i, scene in enumerate(scenes):
             jobs[job_id]['progress'] = f"Processing scene {i+1}/{len(scenes)}"
@@ -464,6 +474,7 @@ def health():
         "status": "ok",
         "ffmpeg": shutil.which('ffmpeg') or "NOT FOUND",
         "ffprobe": shutil.which('ffprobe') or "NOT FOUND",
+        "openai_key_set": bool(os.environ.get("OPENAI_API_KEY")),
         "active_jobs": len(jobs)
     })
 

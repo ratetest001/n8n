@@ -227,24 +227,36 @@ def create_scene_video(scene, temp_dir, scene_index):
             raise Exception(f"Image {i} too small: {img_size} bytes")
         image_paths.append(img_path)
 
-    # ── 4. Create individual image clips ──────────────────────────
+    # ── 4. Create individual image clips with Ken Burns effect ──────
+    # Alternating zoom-in / zoom-out / pan-left / pan-right per clip
+    ken_burns_effects = [
+        # Zoom in from center
+        "scale=8000:-1,zoompan=z='min(zoom+0.0015,1.3)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1280x720:fps=24",
+        # Zoom out from center
+        "scale=8000:-1,zoompan=z='if(lte(zoom,1.0),1.3,max(1.0,zoom-0.0015))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1280x720:fps=24",
+        # Pan left to right with slight zoom
+        "scale=8000:-1,zoompan=z='1.15':x='if(lte(on,1),0,x+1.2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1280x720:fps=24",
+        # Pan right to left with slight zoom
+        "scale=8000:-1,zoompan=z='1.15':x='if(lte(on,1),iw,x-1.2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1280x720:fps=24",
+    ]
+
     clip_paths = []
     for i, img_path in enumerate(image_paths):
         clip_path = os.path.join(temp_dir, f"clip_{scene_index}_{i}.mp4")
+        frames = int(time_per_image * 24)  # 24 fps
+
+        # Pick effect — cycle through the 4 options
+        effect_template = ken_burns_effects[i % len(ken_burns_effects)]
+        effect = effect_template.replace("{frames}", str(frames))
+
         cmd = [
             'ffmpeg', '-y',
             '-loop', '1',
             '-i', img_path,
             '-t', str(time_per_image),
-            '-vf', (
-                'scale=1280:720:'
-                'force_original_aspect_ratio=decrease,'
-                'pad=1280:720:(ow-iw)/2:(oh-ih)/2,'
-                'setsar=1'
-            ),
+            '-vf', effect,
             '-c:v', 'libx264',
             '-preset', 'ultrafast',
-            '-tune', 'stillimage',
             '-crf', '28',
             '-pix_fmt', 'yuv420p',
             '-r', '24',
@@ -253,7 +265,31 @@ def create_scene_video(scene, temp_dir, scene_index):
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            raise Exception(f"Clip {i} failed: {result.stderr[-300:]}")
+            print(f"[Scene {scene_index}] Ken Burns failed for clip {i}, falling back to static")
+            # Fallback to static if Ken Burns fails
+            cmd_fallback = [
+                'ffmpeg', '-y',
+                '-loop', '1',
+                '-i', img_path,
+                '-t', str(time_per_image),
+                '-vf', (
+                    'scale=1280:720:'
+                    'force_original_aspect_ratio=decrease,'
+                    'pad=1280:720:(ow-iw)/2:(oh-ih)/2,'
+                    'setsar=1'
+                ),
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-tune', 'stillimage',
+                '-crf', '28',
+                '-pix_fmt', 'yuv420p',
+                '-r', '24',
+                '-an',
+                clip_path
+            ]
+            result2 = subprocess.run(cmd_fallback, capture_output=True, text=True)
+            if result2.returncode != 0:
+                raise Exception(f"Clip {i} failed: {result2.stderr[-300:]}")
         print(f"[Scene {scene_index}] Clip {i}: {os.path.getsize(clip_path)} bytes")
         clip_paths.append(clip_path)
 

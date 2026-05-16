@@ -7,11 +7,15 @@ import threading
 import uuid
 import shutil
 import sys
+from openai import OpenAI
 
 sys.stdout.reconfigure(line_buffering=True)
 
 app = Flask(__name__)
 jobs = {}
+
+# OpenAI client — set OPENAI_API_KEY in Railway environment variables
+openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 
 # ─────────────────────────────────────────────
@@ -69,44 +73,46 @@ def ms_to_srt_time(ms: float) -> str:
     return f"{hours:02}:{minutes:02}:{seconds:02},{millis:03}"
 
 
-def generate_srt_for_scenes(scenes_with_durations: list[dict]) -> str:
+def transcribe_audio_to_srt_blocks(audio_path: str, start_offset_sec: float) -> list[dict]:
     """
-    Build a single SRT file for all scenes.
-    scenes_with_durations: [{ 'text': str, 'duration_ms': float, 'start_ms': float }]
-    Splits each scene's text into ~10-word chunks for readability.
+    Send audio to OpenAI Whisper API with verbose_json to get segments with timestamps.
+    Returns list of { start_ms, end_ms, text } dicts offset by start_offset_sec.
     """
-    srt_blocks = []
-    index = 1
+    print(f"  [Whisper] Transcribing {os.path.basename(audio_path)} (offset: {start_offset_sec:.2f}s)...")
+    with open(audio_path, 'rb') as f:
+        response = openai_client.audio.transcriptions.create(
+            model="whisper-1",
+            file=f,
+            response_format="verbose_json",
+            timestamp_granularities=["segment"],
+            language="hi"  # Hindi/Hinglish — remove for auto-detect
+        )
 
-    for scene in scenes_with_durations:
-        text = scene['text'].strip()
-        start_ms = scene['start_ms']
-        duration_ms = scene['duration_ms']
+    blocks = []
+    for segment in response.segments:
+        blocks.append({
+            'start_ms': (start_offset_sec + segment.start) * 1000,
+            'end_ms':   (start_offset_sec + segment.end) * 1000,
+            'text':     segment.text.strip()
+        })
 
-        if not text:
-            continue
+    print(f"  [Whisper] Got {len(blocks)} segments")
+    return blocks
 
-        # Split into chunks of ~10 words so subtitles are readable
-        words = text.split()
-        chunk_size = 10
-        chunks = [words[i:i+chunk_size] for i in range(0, len(words), chunk_size)]
-        chunk_duration_ms = duration_ms / len(chunks)
 
-        for j, chunk in enumerate(chunks):
-            chunk_start = start_ms + j * chunk_duration_ms
-            chunk_end = start_ms + (j + 1) * chunk_duration_ms
-            srt_blocks.append(f"{index}")
-            srt_blocks.append(f"{ms_to_srt_time(chunk_start)} --> {ms_to_srt_time(chunk_end)}")
-            srt_blocks.append(" ".join(chunk))
-            srt_blocks.append("")
-            index += 1
-
-    return "\n".join(srt_blocks)
+def build_srt(all_blocks: list[dict]) -> str:
+    """Convert list of { start_ms, end_ms, text } into SRT string."""
+    srt_lines = []
+    for i, block in enumerate(all_blocks, start=1):
+        srt_lines.append(str(i))
+        srt_lines.append(f"{ms_to_srt_time(block['start_ms'])} --> {ms_to_srt_time(block['end_ms'])}")
+        srt_lines.append(block['text'])
+        srt_lines.append("")
+    return "\n".join(srt_lines)
 
 
 def burn_subtitles(video_path: str, srt_path: str, output_path: str):
     """Burn SRT subtitles into video using FFmpeg."""
-    # Escape path for FFmpeg subtitle filter (Windows-safe too)
     escaped_srt = srt_path.replace('\\', '/').replace(':', '\\:')
 
     cmd = [
@@ -116,12 +122,12 @@ def burn_subtitles(video_path: str, srt_path: str, output_path: str):
             f"subtitles='{escaped_srt}':force_style='"
             "FontName=Arial,"
             "FontSize=18,"
-            "PrimaryColour=&H00FFFFFF,"   # white text
-            "OutlineColour=&H00000000,"   # black outline
-            "BackColour=&H80000000,"      # semi-transparent background
+            "PrimaryColour=&H00FFFFFF,"    # white text
+            "OutlineColour=&H00000000,"    # black outline
+            "BackColour=&H80000000,"       # semi-transparent black background
             "Outline=2,"
             "Shadow=1,"
-            "Alignment=2,"               # bottom center
+            "Alignment=2,"                 # bottom center
             "MarginV=30"
             "'"
         ),
@@ -259,12 +265,12 @@ def create_scene_video(scene, temp_dir, scene_index):
     if os.path.exists(silent_video): os.remove(silent_video)
     if os.path.exists(concat_file): os.remove(concat_file)
 
-    # Return scene output + duration (needed for SRT timing)
-    return scene_output, duration
+    # Return scene path + duration + audio path (audio needed for Whisper)
+    return scene_output, duration, audio_path
 
 
 # ─────────────────────────────────────────────
-#  CONCATENATION + SUBTITLE BURN
+#  CONCATENATION
 # ─────────────────────────────────────────────
 
 def concatenate_scenes(scene_videos, output_path, temp_dir):
@@ -306,50 +312,49 @@ def process_video_job(job_id, scenes):
         for i, scene in enumerate(scenes):
             print(f"  Scene {i}: audioFileId={scene.get('audioFileId')} sceneIndex={scene.get('sceneIndex')}")
 
-        # ── Process each scene, collect durations for SRT ──────────
-        scene_videos = []
-        scene_durations = []   # in seconds, one per scene
+        # ── Process each scene ─────────────────────────────────────
+        scene_videos  = []
+        scene_durations = []
+        audio_paths   = []
 
         for i, scene in enumerate(scenes):
             jobs[job_id]['progress'] = f"Processing scene {i+1}/{len(scenes)}"
-            scene_path, duration = create_scene_video(scene, temp_dir, i)
+            scene_path, duration, audio_path = create_scene_video(scene, temp_dir, i)
             scene_videos.append(scene_path)
             scene_durations.append(duration)
+            audio_paths.append(audio_path)
 
-        # ── Concatenate all scenes ──────────────────────────────────
+        # ── Concatenate scenes ─────────────────────────────────────
         jobs[job_id]['progress'] = "Concatenating scenes..."
         raw_output = os.path.join(temp_dir, 'raw_video.mp4')
         concatenate_scenes(scene_videos, raw_output, temp_dir)
 
-        # ── Generate SRT from scene texts + durations ───────────────
-        jobs[job_id]['progress'] = "Generating subtitles..."
-        scenes_with_durations = []
-        cursor_ms = 0.0
-        for i, scene in enumerate(scenes):
-            text = scene.get('text', '').strip()
-            duration_ms = scene_durations[i] * 1000
-            scenes_with_durations.append({
-                'text': text,
-                'start_ms': cursor_ms,
-                'duration_ms': duration_ms
-            })
-            cursor_ms += duration_ms
+        # ── Transcribe each audio via OpenAI Whisper ───────────────
+        jobs[job_id]['progress'] = "Transcribing audio for subtitles..."
+        all_blocks = []
+        cursor_sec = 0.0
 
-        srt_content = generate_srt_for_scenes(scenes_with_durations)
+        for i, audio_path in enumerate(audio_paths):
+            print(f"[Whisper] Scene {i}...")
+            blocks = transcribe_audio_to_srt_blocks(audio_path, start_offset_sec=cursor_sec)
+            all_blocks.extend(blocks)
+            cursor_sec += scene_durations[i]
+
+        # ── Build & save SRT ───────────────────────────────────────
+        srt_content = build_srt(all_blocks)
         srt_path = os.path.join(temp_dir, 'subtitles.srt')
         with open(srt_path, 'w', encoding='utf-8') as f:
             f.write(srt_content)
-        print(f"SRT generated: {len(srt_content)} chars, {srt_content.count('-->') } blocks")
+        print(f"SRT: {len(all_blocks)} blocks written")
 
-        # ── Burn subtitles into final video ─────────────────────────
+        # ── Burn subtitles into final video ───────────────────────
         jobs[job_id]['progress'] = "Burning subtitles..."
         final_output = os.path.join(temp_dir, 'final_video.mp4')
 
-        if srt_content.strip():
+        if all_blocks:
             burn_subtitles(raw_output, srt_path, final_output)
         else:
-            # No text provided in any scene — skip subtitle burn
-            print("No subtitle text found, skipping burn step.")
+            print("No Whisper segments returned, skipping subtitle burn.")
             shutil.copy(raw_output, final_output)
 
         file_size = os.path.getsize(final_output)
@@ -384,7 +389,7 @@ def generate_video():
             return jsonify({"success": False, "error": "Invalid input"}), 400
 
         for i, scene in enumerate(scenes):
-            print(f"  Input scene {i}: audioFileId={scene.get('audioFileId')}, sceneIndex={scene.get('sceneIndex')}, text_preview={scene.get('text', '')[:60]}")
+            print(f"  Input scene {i}: audioFileId={scene.get('audioFileId')}, sceneIndex={scene.get('sceneIndex')}")
 
         job_id = str(uuid.uuid4())
         jobs[job_id] = {

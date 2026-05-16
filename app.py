@@ -122,31 +122,57 @@ def build_srt(all_blocks: list) -> str:
 
 
 def burn_subtitles(video_path: str, srt_path: str, output_path: str):
-    """Burn SRT subtitles into video using FFmpeg."""
-    escaped_srt = srt_path.replace('\\', '/').replace(':', '\\:')
+    """Burn SRT subtitles into video using FFmpeg with Hindi font support."""
+
+    # Use drawtext-friendly approach: pass font file directly via ASS override
+    font_path = "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf"
+    if not os.path.exists(font_path):
+        print(f"WARNING: Font not found at {font_path}, trying fallback...")
+        font_path = None
+
+    # Build the subtitles filter
+    if font_path:
+        # Copy font to same dir as SRT so libass can find it easily
+        font_dir = os.path.dirname(srt_path)
+        font_copy = os.path.join(font_dir, "NotoSansDevanagari-Regular.ttf")
+        shutil.copy(font_path, font_copy)
+        vf = (
+            f"subtitles={srt_path}:fontsdir={font_dir}:force_style="
+            "'FontName=Noto Sans Devanagari"
+            ",FontSize=18"
+            ",PrimaryColour=&H00FFFFFF"
+            ",OutlineColour=&H00000000"
+            ",BackColour=&H80000000"
+            ",Outline=2"
+            ",Shadow=1"
+            ",Alignment=2"
+            ",MarginV=30'"
+        )
+    else:
+        vf = (
+            f"subtitles={srt_path}:force_style="
+            "'FontSize=18"
+            ",PrimaryColour=&H00FFFFFF"
+            ",OutlineColour=&H00000000"
+            ",Outline=2"
+            ",Alignment=2"
+            ",MarginV=30'"
+        )
 
     cmd = [
         'ffmpeg', '-y',
         '-i', video_path,
-        '-vf', (
-            f"subtitles='{escaped_srt}':fontsdir='/usr/share/fonts/truetype/noto':force_style='"
-            "FontName=Noto Sans Devanagari,"
-            "FontSize=18,"
-            "PrimaryColour=&H00FFFFFF,"    # white text
-            "OutlineColour=&H00000000,"    # black outline
-            "BackColour=&H80000000,"       # semi-transparent black background
-            "Outline=2,"
-            "Shadow=1,"
-            "Alignment=2,"                 # bottom center
-            "MarginV=30"
-            "'"
-        ),
+        '-vf', vf,
         '-c:a', 'copy',
         output_path
     ]
+
+    print(f"[Subtitle] Running FFmpeg with vf: {vf[:120]}...")
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise Exception(f"Subtitle burn failed: {result.stderr[-500:]}")
+        # Log full stderr for easier debugging
+        print(f"[Subtitle] FULL STDERR:\n{result.stderr}")
+        raise Exception(f"Subtitle burn failed: {result.stderr[-800:]}")
     print(f"Subtitles burned → {os.path.getsize(output_path)} bytes")
     return output_path
 
